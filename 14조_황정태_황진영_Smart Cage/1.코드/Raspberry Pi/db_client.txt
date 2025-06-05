@@ -1,0 +1,377 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <pthread.h>
+#include <signal.h>
+#include <mysql/mysql.h>
+
+#define BUF_SIZE 100
+#define NAME_SIZE 20
+#define ARR_CNT 10
+
+#define T 1
+#define F 0
+
+#define ON 1
+#define OFF 0
+
+#define DEBUG
+
+void* send_msg(void* arg);
+void* recv_msg(void* arg);
+void error_handling(char* msg);
+
+char name[NAME_SIZE] = "[Default]";
+char msg[BUF_SIZE];
+
+void remove_crlf(char *str) {
+    char *p;
+    if ((p = strchr(str, '\r')) != NULL) *p = '\0';
+    if ((p = strchr(str, '\n')) != NULL) *p = '\0';
+}
+
+int main(int argc, char* argv[])
+{
+    int sock;
+    struct sockaddr_in serv_addr;
+    pthread_t snd_thread, rcv_thread;
+    void* thread_return;
+
+    if (argc != 4) {
+        printf("Usage : %s <IP> <port> <name>\n", argv[0]);
+        exit(1);
+    }
+
+    snprintf(name, sizeof(name), "%s", argv[3]);
+
+    sock = socket(PF_INET, SOCK_STREAM, 0);
+    if (sock == -1)
+        error_handling("socket() error");
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = inet_addr(argv[1]);
+    serv_addr.sin_port = htons(atoi(argv[2]));
+
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == -1)
+        error_handling("connect() error");
+
+    snprintf(msg, sizeof(msg), "[%s:PASSWD]", name);
+    write(sock, msg, strlen(msg));
+    pthread_create(&rcv_thread, NULL, recv_msg, (void*)&sock);
+    pthread_create(&snd_thread, NULL, send_msg, (void*)&sock);
+
+    pthread_join(snd_thread, &thread_return);
+    pthread_join(rcv_thread, &thread_return);
+
+    if(sock != -1)
+        close(sock);
+
+    return 0;
+}
+
+void* send_msg(void* arg)
+{
+    int* sock = (int*)arg;
+    int ret;
+    fd_set initset, newset;
+    struct timeval tv;
+    char name_msg[NAME_SIZE + BUF_SIZE + 2];
+
+    FD_ZERO(&initset);
+    FD_SET(STDIN_FILENO, &initset);
+
+    while (1) {
+        memset(msg, 0, sizeof(msg));
+        name_msg[0] = '\0';
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        newset = initset;
+        ret = select(STDIN_FILENO + 1, &newset, NULL, NULL, &tv);
+        if (FD_ISSET(STDIN_FILENO, &newset)) {
+            fgets(msg, BUF_SIZE, stdin);
+            if (!strncmp(msg, "quit\n", 5)) {
+                *sock = -1;
+                return NULL;
+            } else if (msg[0] != '[') {
+                strcat(name_msg, "[ALLMSG]");
+                strcat(name_msg, msg);
+            } else {
+                strcpy(name_msg, msg);
+            }
+            if (write(*sock, name_msg, strlen(name_msg)) <= 0) {
+                *sock = -1;
+                return NULL;
+            }
+        }
+        if (ret == 0) {
+            if (*sock == -1)
+                return NULL;
+        }
+    }
+}
+
+void* recv_msg(void* arg)
+{
+    MYSQL* conn;
+    MYSQL_ROW sqlrow;
+    int res;
+    char sql_cmd[256] = { 0 };
+    char* host = "localhost";
+    char* user = "smartcage";
+    char* pass = "smartcage";
+    char* dbname = "smartcage";
+
+    int* sock = (int*)arg;
+    int i;
+    char* pToken;
+    char* pArray[ARR_CNT] = { 0 };
+    char name_msg[NAME_SIZE + BUF_SIZE + 1];
+    int str_len;
+
+    conn = mysql_init(NULL);
+    if (!(mysql_real_connect(conn, host, user, pass, dbname, 0, NULL, 0))) {
+        fprintf(stderr, "ERROR : %s[%d]\n", mysql_error(conn), mysql_errno(conn));
+        exit(1);
+    }
+
+    while (1) {
+        memset(name_msg, 0x0, sizeof(name_msg));
+        str_len = read(*sock, name_msg, NAME_SIZE + BUF_SIZE);
+        if (str_len <= 0) {
+            *sock = -1;
+            return NULL;
+        }
+        // name_msg[str_len - 1] = 0;	// '\n' 제거
+        fputs(name_msg, stdout);
+		name_msg[strcspn(name_msg, "\n")] = '\0';	// '\0' or 0 (ASCII)
+
+        pToken = strtok(name_msg, "[:@]");
+        i = 0;
+        while (pToken != NULL) {
+            pArray[i] = pToken;
+            if (++i >= ARR_CNT)
+                break;
+            pToken = strtok(NULL, "[:@]");
+        }
+
+
+        if (!strcmp(pArray[1], "CREATE_CAGE") && i == 2)
+        {
+            // [NUM]CREATECAGE
+            // Cage 테이블에 새 케이지 등록
+            remove_crlf(pArray[0]);
+            remove_crlf(pArray[1]);
+
+            snprintf(sql_cmd, sizeof(sql_cmd),
+                "INSERT INTO Cage (is_available, user_id, win_state, fan_state, led_state) "
+                "VALUES (%d, NULL, %d, %d, %d)", T, OFF, OFF, OFF);
+            if (mysql_query(conn, sql_cmd)) {
+                fprintf(stderr, "%s\n", mysql_error(conn));
+                snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s\n", pArray[0], pArray[1], "FAILURE");
+                write(*sock, sql_cmd, strlen(sql_cmd));
+                break;
+            }
+            // 결과 전송
+            snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s\n", pArray[0], pArray[1], "SUCCESS");
+            #ifdef DEBUG
+            fputs(sql_cmd, stdout);
+            #endif
+            write(*sock, sql_cmd, strlen(sql_cmd));
+        }
+        else if (!strcmp(pArray[1], "DEL_CAGE") && i == 3)
+        {
+            remove_crlf(pArray[0]);
+            remove_crlf(pArray[1]);
+            remove_crlf(pArray[2]);
+            
+            // [NUM]DELCAGE@cage_id
+            snprintf(sql_cmd, sizeof(sql_cmd), "DELETE FROM Cage WHERE cage_id=%d", atoi(pArray[2]));
+            if (mysql_query(conn, sql_cmd)) {
+                fprintf(stderr, "%s\n", mysql_error(conn));
+                snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s\n", pArray[0], pArray[1], "FAILURE");
+                write(*sock, sql_cmd, strlen(sql_cmd));
+                break;
+            }
+            snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s\n", pArray[0], pArray[1], "SUCCESS");
+            write(*sock, sql_cmd, strlen(sql_cmd));
+        }
+        else if (!strcmp(pArray[1], "GET_CAGE_STATUS") && i == 3)
+        {
+            // [NUM]GETCAGESTATUS@cage_id
+            // cage_id에 해당하는 케이지의 상태 조회 쿼리 작성
+            remove_crlf(pArray[0]);
+            remove_crlf(pArray[1]);
+            remove_crlf(pArray[2]);
+
+            snprintf(sql_cmd, sizeof(sql_cmd),
+                    "SELECT win_state, fan_state, led_state FROM Cage WHERE cage_id=%d",
+                    atoi(pArray[2]));
+
+            // SQL 실행
+            if (mysql_query(conn, sql_cmd)) {
+                fprintf(stderr, "%s\n", mysql_error(conn));
+                snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s@%s\n",
+                        pArray[0], pArray[1], pArray[2], "FAILURE");
+                write(*sock, sql_cmd, strlen(sql_cmd));
+                break;
+            }
+
+            MYSQL_RES* result = mysql_store_result(conn);
+            if (result == NULL) {
+                fprintf(stderr, "%s\n", mysql_error(conn));
+                snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s@%s\n",
+                        pArray[0], pArray[1], pArray[2], "FAILURE");
+                write(*sock, sql_cmd, strlen(sql_cmd));
+                break;
+            }
+            snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s",
+                    pArray[0], pArray[1], pArray[2]);
+
+            while ((sqlrow = mysql_fetch_row(result)) != NULL) {
+                snprintf(name_msg, sizeof(name_msg),
+                        "@%s@%s@%s", sqlrow[0], sqlrow[1], sqlrow[2]);
+                strncat(sql_cmd, name_msg, sizeof(sql_cmd) - strlen(sql_cmd) - 1);
+            }
+            strncat(sql_cmd, "\n", sizeof(sql_cmd) - strlen(sql_cmd) - 1);
+            write(*sock, sql_cmd, strlen(sql_cmd));
+            mysql_free_result(result);
+        }
+        else if (!strcmp(pArray[1], "SET_CAGE_STATUS") && i == 5) {
+            // [NUM]SETCAGESTATUS@cage_id@WIN@ON or OFF
+            // [NUM]SETCAGESTATUS@cage_id@FAN@ON or OFF
+            // [NUM]SETCAGESTATUS@cage_id@LED@ON or OFF
+            remove_crlf(pArray[2]);
+            remove_crlf(pArray[3]);
+            remove_crlf(pArray[4]);
+
+            if(strcmp(pArray[3], "WIN") == 0) {
+                snprintf(sql_cmd, sizeof(sql_cmd), "UPDATE Cage SET win_state=%d WHERE cage_id=%d", (strcmp(pArray[4], "ON") == 0) ? ON : OFF, atoi(pArray[2]));
+            } else if(strcmp(pArray[3], "FAN") == 0) {
+                snprintf(sql_cmd, sizeof(sql_cmd), "UPDATE Cage SET fan_state=%d WHERE cage_id=%d", (strcmp(pArray[4], "ON") == 0) ? ON : OFF, atoi(pArray[2]));
+            } else if(strcmp(pArray[3], "LED") == 0) {
+                snprintf(sql_cmd, sizeof(sql_cmd), "UPDATE Cage SET led_state=%d WHERE cage_id=%d", (strcmp(pArray[4], "ON") == 0) ? ON : OFF, atoi(pArray[2]));
+            }
+            
+            if (mysql_query(conn, sql_cmd)) {
+                fprintf(stderr, "%s\n", mysql_error(conn));
+                snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s@%s@%s\n", pArray[0], pArray[1], pArray[2], pArray[3], pArray[4], "FAILURE");
+                write(*sock, sql_cmd, strlen(sql_cmd));
+                break;
+            }
+            snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s@%s@%s\n", pArray[0], pArray[1], pArray[2], pArray[3], pArray[4], "SUCCESS");
+            write(*sock, sql_cmd, strlen(sql_cmd));
+        }
+        else if (!strcmp(pArray[1], "GET_EMPTY_CAGE_ID_ALL") && i == 2) {
+            // [NUM]GET_EMPTY_CAGE_ID_ALL
+            remove_crlf(pArray[0]);
+            remove_crlf(pArray[1]);
+
+            snprintf(sql_cmd, sizeof(sql_cmd), "SELECT cage_id FROM Cage WHERE is_available=%d", T);
+            if (mysql_query(conn, sql_cmd)) {
+                fprintf(stderr, "%s\n", mysql_error(conn));
+                break;
+            }
+            MYSQL_RES* result = mysql_store_result(conn);
+            if (result == NULL) {
+                fprintf(stderr, "%s\n", mysql_error(conn));
+                break;
+            }
+            snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s", pArray[0], pArray[1]);
+            while ((sqlrow = mysql_fetch_row(result)) != NULL) {
+                snprintf(name_msg, sizeof(name_msg), "@%s", sqlrow[0]);
+                strncat(sql_cmd, name_msg, sizeof(sql_cmd) - strlen(sql_cmd) - 1);
+            }
+            strncat(sql_cmd, "\n", sizeof(sql_cmd) - strlen(sql_cmd) - 1);
+            write(*sock, sql_cmd, strlen(sql_cmd));
+            mysql_free_result(result);
+        }
+        else if (!strcmp(pArray[1], "ASSIGN_CAGE") && i == 4) {
+            // [NUM]ASSIGN_CAGE@cage_id@user_id
+            remove_crlf(pArray[0]);
+            remove_crlf(pArray[1]);
+            remove_crlf(pArray[2]);
+            remove_crlf(pArray[3]);
+
+            snprintf(sql_cmd, sizeof(sql_cmd), "UPDATE Cage SET is_available=%d, user_id='%s' WHERE cage_id=%d",
+                     F, pArray[3], atoi(pArray[2]));
+            if (mysql_query(conn, sql_cmd)) {
+                fprintf(stderr, "%s\n", mysql_error(conn));
+                snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s@%s@%s\n", pArray[0], pArray[1], pArray[2], pArray[3], "FAILURE");
+                write(*sock, sql_cmd, strlen(sql_cmd));
+                break;
+            }
+            snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s@%s@%s\n", pArray[0], pArray[1], pArray[2], pArray[3], "SUCCESS");
+            write(*sock, sql_cmd, strlen(sql_cmd));
+        }
+        else if (!strcmp(pArray[1], "UNASSIGN_CAGE") && i == 3) {
+            // [NUM]ASSIGN_CAGE@cage_id
+            remove_crlf(pArray[0]);
+            remove_crlf(pArray[1]);
+            remove_crlf(pArray[2]);
+
+            snprintf(sql_cmd, sizeof(sql_cmd), "UPDATE Cage SET is_available=%d, user_id=NULL WHERE cage_id=%d",
+                     T, atoi(pArray[2]));
+            if (mysql_query(conn, sql_cmd)) {
+                fprintf(stderr, "%s\n", mysql_error(conn));
+                snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s@%s\n", pArray[0], pArray[1], pArray[2], "FAILURE");
+                write(*sock, sql_cmd, strlen(sql_cmd));
+                break;
+            }
+            snprintf(sql_cmd, sizeof(sql_cmd), "[%s]%s@%s@%s\n", pArray[0], pArray[1], pArray[2], "SUCCESS");
+            write(*sock, sql_cmd, strlen(sql_cmd));
+        }
+        else {
+            continue;
+        }
+    }
+
+    mysql_close(conn);
+    return NULL;
+}
+
+void error_handling(char* msg)
+{
+    fputs(msg, stderr);
+    fputc('\n', stderr);
+    exit(1);
+}
+
+
+/*
+======================[ Smart Cage 명령어 목록 ]======================
+
+[NUM]CREATE_CAGE
+  - 새로운 케이지를 생성합니다.
+  - DB: Cage 테이블에 새 레코드 삽입 (is_available=T, user_id=NULL, 상태 OFF)
+
+[NUM]DEL_CAGE@cage_id
+  - 지정한 cage_id의 케이지를 삭제합니다.
+  - DB: Cage 테이블에서 해당 row 삭제
+
+[NUM]GET_CAGE_STATUS@cage_id
+  - 특정 케이지의 상태(win_state, fan_state, led_state)를 조회합니다.
+  - 응답: [NUM]GET_CAGE_STATUS@cage_id@win@fan@led
+
+[NUM]SET_CAGE_STATUS@cage_id@<WIN|FAN|LED>@<ON|OFF>
+  - 특정 케이지의 지정 장치를 ON 또는 OFF로 설정합니다.
+  - 예: [3]SET_CAGE_STATUS@2@WIN@ON
+
+[NUM]GET_EMPTY_CAGE_ID_ALL
+  - 사용 가능한 모든 케이지 ID를 조회합니다 (is_available = T).
+  - 응답: [NUM]GET_EMPTY_CAGE_ID_ALL@1@2@5 ...
+
+[NUM]ASSIGN_CAGE@cage_id@user_id
+  - 케이지를 특정 사용자에게 할당합니다.
+  - DB: is_available=F, user_id=<user_id>
+
+[NUM]UNASSIGN_CAGE@cage_id
+  - 케이지의 할당을 해제합니다.
+  - DB: is_available=T, user_id=NULL
+
+=======================================================================
+*/

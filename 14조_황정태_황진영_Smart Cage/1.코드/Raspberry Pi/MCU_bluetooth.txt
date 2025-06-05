@@ -1,0 +1,205 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <pthread.h>
+#include <signal.h>
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/rfcomm.h>
+
+#define BUF_SIZE 100      // 메시지 버퍼 크기
+#define NAME_SIZE 20      // 이름 버퍼 크기
+#define ARR_CNT 5         // 최대 토큰 수
+
+// 메시지 송수신 및 에러 처리를 위한 함수 선언
+void * send_msg(void * arg);
+void * recv_msg(void * arg);
+void error_handling(char * msg);
+
+// 기본 이름
+char name[NAME_SIZE] = "[Default]";
+
+// 소켓 파일 디스크립터 구조체
+typedef struct {
+    int sockfd;                 // 서버와의 TCP 연결 소켓
+    int btfd;                   // 블루투스 소켓
+    char sendid[NAME_SIZE];     // 메시지 보낼 ID 저장용 (사용하지 않음)
+} DEV_FD;
+
+int main(int argc, char *argv[])
+{
+    DEV_FD dev_fd;
+    struct sockaddr_in serv_addr;
+    pthread_t snd_thread, rcv_thread;
+    void * thread_return;
+    int ret;
+    struct sockaddr_rc addr = { 0 };         // 블루투스 주소 구조체
+    // char dest[18] = "98:DA:60:02:B7:30";      // 블루투스 대상 MAC 주소 (ARDUINO)
+	char dest[18] = "98:DA:60:0D:9A:80";      // 블루투스 대상 MAC 주소 (ARDUINO)
+    char msg[BUF_SIZE];
+
+    // 인자 확인: IP, PORT, 이름
+    if(argc != 4) {
+        printf("Usage : %s <IP> <port> <name>\n", argv[0]);
+        exit(1);
+    }
+
+    // 이름 저장
+    sprintf(name, "%s", argv[3]);
+
+    // TCP 소켓 생성
+    dev_fd.sockfd = socket(PF_INET, SOCK_STREAM, 0);
+    if(dev_fd.sockfd == -1)
+        error_handling("socket() error");
+
+    // 서버 주소 설정
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = inet_addr(argv[1]);
+    serv_addr.sin_port = htons(atoi(argv[2]));
+
+    // 서버 연결 시도
+    if(connect(dev_fd.sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1)
+        error_handling("connect() error");
+
+    // 로그인용 메시지 전송
+    sprintf(msg,"[%s:PASSWD]", name);
+    write(dev_fd.sockfd, msg, strlen(msg));
+
+    // 블루투스 소켓 생성
+    dev_fd.btfd = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+    if(dev_fd.btfd == -1){
+        perror("socket()");
+        exit(1);
+    }
+
+    // 블루투스 연결 설정
+    addr.rc_family = AF_BLUETOOTH;
+    addr.rc_channel = (uint8_t)1;
+    str2ba(dest, &addr.rc_bdaddr);   // 문자열 MAC 주소 → bdaddr_t 변환
+
+    // 블루투스 연결 시도
+    ret = connect(dev_fd.btfd, (struct sockaddr *)&addr, sizeof(addr));
+    if(ret == -1){
+        perror("connect()");
+        exit(1);
+    }
+
+    // 송수신 스레드 생성
+    pthread_create(&rcv_thread, NULL, recv_msg, (void *)&dev_fd);  // 서버→블루투스
+    pthread_create(&snd_thread, NULL, send_msg, (void *)&dev_fd);  // 블루투스→서버
+
+    // 송신 스레드 종료 대기 (종료 시 종료 처리)
+    pthread_join(snd_thread, &thread_return);
+
+    close(dev_fd.sockfd);
+    return 0;
+}
+
+// 블루투스에서 받은 메시지를 서버로 전달
+void * send_msg(void * arg)
+{
+    DEV_FD *dev_fd = (DEV_FD *)arg;
+    int str_len;
+    int ret;
+    fd_set initset, newset;
+    struct timeval tv;
+    char name_msg[NAME_SIZE + BUF_SIZE+2];
+    char msg[BUF_SIZE];
+    int total = 0;
+
+    FD_ZERO(&initset);
+    FD_SET(dev_fd->sockfd, &initset);   // 서버 소켓 (모니터링 필요 X)
+    FD_SET(dev_fd->btfd, &initset);     // 블루투스 소켓
+
+    while(1) {
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        newset = initset;
+
+        // 블루투스에서 수신 여부 확인
+        ret = select(dev_fd->btfd + 1, &newset, NULL, NULL, &tv);
+
+        if(FD_ISSET(dev_fd->btfd, &newset)) {
+            // 블루투스로부터 데이터 수신
+            ret = read(dev_fd->btfd, msg + total, BUF_SIZE - total);
+            if(ret > 0) {
+                total += ret;
+            } else if(ret == 0) {
+                dev_fd->sockfd = -1;
+                return NULL;
+            }
+
+            // 메시지가 끝났는지 확인 (개행 기준)
+            if(msg[total - 1] == '\n') {
+                msg[total] = 0;
+                total = 0;
+            } else {
+                continue;  // 메시지 누적
+            }
+
+            // 디버깅 출력
+            //fputs("ARD:", stdout);
+            //fputs(msg, stdout);
+
+            // 서버로 메시지 전송
+            if(write(dev_fd->sockfd, msg, strlen(msg)) <= 0) {
+                dev_fd->sockfd = -1;
+                return NULL;
+            }
+        }
+
+        // 타임아웃 발생 후 연결 상태 확인
+        if(ret == 0) {
+            if(dev_fd->sockfd == -1)
+                return NULL;
+        }
+    }
+}
+
+// 서버로부터 받은 메시지를 블루투스로 전달
+void * recv_msg(void * arg)
+{
+    DEV_FD *dev_fd = (DEV_FD *)arg;
+    int i;
+    char *pToken;
+    char *pArray[ARR_CNT] = {0};
+    char name_msg[NAME_SIZE + BUF_SIZE + 1];
+    int str_len;
+
+    while(1) {
+        memset(name_msg, 0x0, sizeof(name_msg));
+
+        // 서버로부터 메시지 수신
+        str_len = read(dev_fd->sockfd, name_msg, NAME_SIZE + BUF_SIZE);
+        if(str_len <= 0) {
+            dev_fd->sockfd = -1;
+            return NULL;
+        }
+
+        name_msg[str_len] = 0;
+        
+        // 디버깅 출력
+        // fputs("SRV:", stdout);
+        // fputs(name_msg, stdout);
+
+        // 블루투스로 메시지 전달
+        if (name_msg[strlen(name_msg) - 1] != '\n') {
+            strcat(name_msg, "\n");  //개행 추가
+        }
+
+        write(dev_fd->btfd, name_msg, strlen(name_msg));
+
+    }
+}
+
+// 에러 메시지 출력 후 종료
+void error_handling(char * msg)
+{
+    fputs(msg, stderr);
+    fputc('\n', stderr);
+    exit(1);
+}

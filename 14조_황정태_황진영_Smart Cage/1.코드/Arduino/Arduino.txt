@@ -1,0 +1,314 @@
+// 스마트 케이지 LCD + 블루투스 제어 코드
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SoftwareSerial.h>
+#include <MsTimer2.h>
+
+// 블루투스 시리얼 (10: RX, 11: TX)
+SoftwareSerial BTSerial(10, 11);
+
+// 조이스틱 핀 설정
+int xPin = A0;
+int yPin = A1;
+int swPin = 2;
+
+// LCD 객체 생성 (I2C 주소 0x27, 16x2 크기)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// 기기 상태 저장용 문자열 배열
+String wnStatus[2] = { "OFF", "OFF" }; // 창문
+String dcStatus[2] = { "OFF", "OFF" }; // 선풍기
+String ldStatus[2] = { "OFF", "OFF" }; // 조명
+
+// 케이지 사용 가능 여부
+bool isAvailable[2] = { false, false };
+
+// 선택된 케이지 및 디바이스 인덱스
+int selectedCage = 0;
+int selectedDevice = 0;
+const int maxDeviceCursor = 3; // WIN, FAN, LED, UNASSIGN
+int currentPage = 0; // 0: 메인화면, 1: 상세 제어 화면
+
+// 디바운싱 및 명령 전송 주기 제어용
+unsigned long lastMoveTime = 0;
+unsigned long lastButtonTime = 0;
+const unsigned long moveDelay = 300;
+const unsigned long buttonDebounce = 200;
+
+// 블루투스 수신 버퍼
+String btBuffer = "";
+unsigned long lastReceiveTime = 0;
+const unsigned long receiveTimeout = 700;
+
+// 센서값 저장
+String sensorTemp = "--";
+String sensorHumi = "--";
+String sensorLight = "--";
+
+// 초기화 상태머신
+enum InitState {
+  SEND_CAGE1,
+  WAIT_CAGE1,
+  SEND_CAGE2,
+  WAIT_CAGE2,
+  SEND_EMPTY_LIST,
+  WAIT_EMPTY_LIST,
+  INIT_DONE
+};
+
+InitState initState = SEND_CAGE1;
+unsigned long lastCommandTime = 0;
+const unsigned long commandInterval = 200;
+
+void setup() {
+  Serial.begin(115200);
+  lcd.init();
+  lcd.backlight();
+  pinMode(swPin, INPUT_PULLUP);
+  BTSerial.begin(9600);
+  Serial.println("=== System Booting ===");
+  lastCommandTime = millis();
+}
+
+void loop() {
+  // 블루투스 수신 처리
+  if (BTSerial.available()) {
+    char c = BTSerial.read();
+    if (c >= 32 && c <= 126) btBuffer += c;
+    if (c == '\n') {
+      Serial.print("Received Message: ");
+      Serial.println(btBuffer);
+      handleServerResponse(btBuffer);
+      btBuffer = "";
+    }
+    lastReceiveTime = millis();
+  }
+
+  // 수신 시간 초과 처리
+  if (btBuffer.length() > 0 && (millis() - lastReceiveTime > receiveTimeout)) {
+    Serial.print("Timeout Received Message: ");
+    Serial.println(btBuffer);
+    handleServerResponse(btBuffer);
+    btBuffer = "";
+  }
+
+  // 초기화 명령 주기적 전송
+  unsigned long now = millis();
+  if (initState != INIT_DONE && now - lastCommandTime >= commandInterval) {
+    sendInitCommands();
+    lastCommandTime = now;
+  }
+
+  // 조이스틱 입력 처리
+  int xVal = analogRead(xPin);
+  int yVal = analogRead(yPin);
+
+  if (millis() - lastMoveTime > moveDelay) {
+    if (currentPage == 0) {
+      // 메인페이지에서 상하 이동 (Cage 선택)
+      if (yVal < 300 || yVal > 700) {
+        selectedCage = 1 - selectedCage;
+        showMainPage();
+        lastMoveTime = millis();
+      }
+    } else if (currentPage == 1) {
+      // 상세페이지에서 좌우 이동 (기기 선택)
+      if (xVal < 300) {
+        selectedDevice = (selectedDevice == 0) ? maxDeviceCursor : selectedDevice - 1;
+        showDetailPage();
+        lastMoveTime = millis();
+      } else if (xVal > 700) {
+        selectedDevice = (selectedDevice == maxDeviceCursor) ? 0 : selectedDevice + 1;
+        showDetailPage();
+        lastMoveTime = millis();
+      }
+    }
+  }
+
+  // 버튼 입력 처리
+  if (digitalRead(swPin) == LOW && millis() - lastButtonTime > buttonDebounce) {
+    handleButtonPress();
+    lastButtonTime = millis();
+  }
+}
+
+// 초기 명령 전송 (상태 요청)
+void sendInitCommands() {
+  switch (initState) {
+    case SEND_CAGE1:
+      BTSerial.print("[DB]GET_CAGE_STATUS@1\n");
+      Serial.println("Sent: [DB]GET_CAGE_STATUS@1");
+      initState = WAIT_CAGE1;
+      break;
+    case SEND_CAGE2:
+      BTSerial.print("[DB]GET_CAGE_STATUS@2\n");
+      Serial.println("Sent: [DB]GET_CAGE_STATUS@2");
+      initState = WAIT_CAGE2;
+      break;
+    case SEND_EMPTY_LIST:
+      BTSerial.print("[DB]GET_EMPTY_CAGE_ID_ALL\n");
+      Serial.println("Sent: [DB]GET_EMPTY_CAGE_ID_ALL");
+      initState = WAIT_EMPTY_LIST;
+      break;
+    default:
+      break;
+  }
+}
+
+// 버튼 입력 처리: 할당/제어/해제
+void handleButtonPress() {
+  if (currentPage == 0) {
+    // if (!isAvailable[selectedCage]) {
+    //   lcd.clear();
+    //   lcd.setCursor(0, 0);
+    //   lcd.print("Cage In Use");
+    //   lastMoveTime = millis();
+    //   showMainPage();
+    //   return;
+    // }
+    currentPage = 1;
+    selectedDevice = 0;
+    showDetailPage();
+
+    // 제어 후 상태 재요청
+    BTSerial.print("[DB]GET_CAGE_STATUS@1\n");
+    // Serial.println(">>[DB]GET_CAGE_STATUS@1\n");
+    delay(100);
+    BTSerial.print("[CAGE_1]GET_SENSOR_DATA@1\n");
+    // Serial.println(">>[CAGE_1]GET_SENSOR_DATA@1\n");
+  } else if (currentPage == 1) {
+    if (selectedDevice == 3) {
+      currentPage = 0;
+      showMainPage();
+      return;
+    }
+    // 기기 제어
+    String deviceCode = (selectedDevice == 0) ? "WIN" : (selectedDevice == 1) ? "FAN" : "LED";
+    String currentState = (deviceCode == "WIN") ? wnStatus[selectedCage] : (deviceCode == "FAN") ? dcStatus[selectedCage] : ldStatus[selectedCage];
+    String requestState = (currentState == "ON") ? "OFF" : "ON";
+    // 기기 제어 요청
+    String msg = "[CAGE_1]CAGE_CONTROL@" + String(selectedCage + 1) + "@" + deviceCode + "@" + requestState + "\n";
+    BTSerial.print(msg);
+    Serial.print("Sent Control Command: ");
+    Serial.println(msg);
+  }
+}
+
+// 서버 메시지 처리
+void handleServerResponse(String msg) {
+  int endBracket = msg.indexOf(']');
+  if (endBracket == -1) return;
+  String payload = msg.substring(endBracket + 1);
+
+  if (payload.startsWith("GET_CAGE_STATUS@")) {
+    handleCageStatusResponse(payload);
+    if (initState == WAIT_CAGE1) initState = SEND_CAGE2;
+    else if (initState == WAIT_CAGE2) initState = SEND_EMPTY_LIST;
+  } else if (payload.startsWith("GET_EMPTY_CAGE_ID_ALL")) {
+    handleEmptyCageList(payload);
+    if (initState == WAIT_EMPTY_LIST) initState = INIT_DONE;
+    Serial.println("Initialization Done");
+    showMainPage();
+  } else if (payload.startsWith("GET_SENSOR_DATA@")) {
+    handleSensorDataResponse(payload);
+  } else if (payload.startsWith("CAGE_CONTROL@")) {
+    handleSetStatusResponse(payload);
+  }
+}
+
+// 케이지 상태 수신 처리
+void handleCageStatusResponse(String payload) {
+  int p1 = payload.indexOf('@');
+  int p2 = payload.indexOf('@', p1 + 1);
+  int p3 = payload.indexOf('@', p2 + 1);
+  int p4 = payload.indexOf('@', p3 + 1);
+  int cageID = payload.substring(p1 + 1, p2).toInt() - 1;
+  wnStatus[cageID] = (payload.substring(p2 + 1, p3) == "1") ? "ON" : "OFF";
+  dcStatus[cageID] = (payload.substring(p3 + 1, p4) == "1") ? "ON" : "OFF";
+  ldStatus[cageID] = (payload.substring(p4 + 1) == "1") ? "ON" : "OFF";
+  showDetailPage();
+}
+
+// 센서 데이터 수신 처리
+void handleSensorDataResponse(String payload) {
+  // 예시: GET_SENSOR_DATA@1@28.9@44@2.87
+  int p1 = payload.indexOf('@');               // 1 위치
+  int p2 = payload.indexOf('@', p1 + 1);       // 28.9 시작
+  int p3 = payload.indexOf('@', p2 + 1);       // 44 시작
+  int p4 = payload.indexOf('@', p3 + 1);       // 2.87 시작 (끝까지)
+
+  // 원하는 값 추출
+  sensorTemp = payload.substring(p2 + 1, p3);      // 28.9
+  sensorHumi = payload.substring(p3 + 1, p4);      // 44
+  sensorLight = payload.substring(p4 + 1);         // 2.87
+
+  showDetailPage();
+}
+
+// 제어 결과 수신 처리
+void handleSetStatusResponse(String payload) {
+  int p1 = payload.indexOf('@');
+  int p2 = payload.indexOf('@', p1 + 1);
+  int p3 = payload.indexOf('@', p2 + 1);
+  int p4 = payload.indexOf('@', p3 + 1);
+  int cageID = payload.substring(p1 + 1, p2).toInt() - 1;
+  String device = payload.substring(p2 + 1, p3);
+  String state = payload.substring(p3 + 1, p4);
+  String result = payload.substring(p4 + 1);
+  if (result != "SUCCESS") return;
+  if (device == "WIN") wnStatus[cageID] = state;
+  else if (device == "FAN") dcStatus[cageID] = state;
+  else if (device == "LED") ldStatus[cageID] = state;
+  showDetailPage();
+}
+
+// 빈 케이지 목록 수신 처리
+void handleEmptyCageList(String payload) {
+  isAvailable[0] = false;
+  isAvailable[1] = false;
+  int pos = payload.indexOf('@');
+  while (pos != -1) {
+    int nextPos = payload.indexOf('@', pos + 1);
+    String cageIDStr = (nextPos != -1) ? payload.substring(pos + 1, nextPos) : payload.substring(pos + 1);
+    int cageID = cageIDStr.toInt() - 1;
+    if (cageID >= 0 && cageID < 2) isAvailable[cageID] = true;
+    pos = nextPos;
+  }
+}
+
+// 메인 LCD 화면 출력
+void showMainPage() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Cage1 ");
+  lcd.print(isAvailable[0] ? "OFF" : "ON");
+  lcd.setCursor(14, 0);
+  if (selectedCage == 0) lcd.print("<");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Cage2 ");
+  lcd.print(isAvailable[1] ? "OFF" : "ON");
+  lcd.setCursor(14, 1);
+  if (selectedCage == 1) lcd.print("<");
+}
+
+// 상세 LCD 화면 출력
+void showDetailPage() {
+  lcd.clear();
+  int tempDot = sensorTemp.indexOf('.');
+  String tempShort = (tempDot != -1) ? sensorTemp.substring(0, tempDot + 2) : sensorTemp;
+  int lightDot = sensorLight.indexOf('.');
+  String lightShort = (lightDot != -1) ? sensorLight.substring(0, lightDot + 2) : sensorLight;
+  String line = "T:" + tempShort + "H:" + sensorHumi + "L:" + lightShort;
+  line = line.substring(0, min(16, line.length()));
+  lcd.setCursor(0, 0);
+  lcd.print(line);
+  lcd.setCursor(0, 1);
+  lcd.print((selectedDevice == 0) ? ">W" : " W");
+  lcd.print(wnStatus[selectedCage]);
+  lcd.print((selectedDevice == 1) ? ">F" : " F");
+  lcd.print(dcStatus[selectedCage]);
+  lcd.print((selectedDevice == 2) ? ">L" : " L");
+  lcd.print(ldStatus[selectedCage]);
+  lcd.print((selectedDevice == 3) ? ">." : " .");
+}

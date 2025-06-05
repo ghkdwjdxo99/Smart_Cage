@@ -1,0 +1,262 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <pthread.h>
+#include <signal.h>
+
+#define BUF_SIZE 100
+#define NAME_SIZE 20
+#define ARR_CNT 10
+
+#define T 1
+#define F 0
+#define ON 1
+#define OFF 0
+
+void *recv_msg(void *arg);
+void error_handling(char *msg);
+void user_command_loop(int *sock);
+void send_msg(int *sock, const char *msg);
+
+char DB_name[NAME_SIZE] = "DB";
+char name[NAME_SIZE] = "[Default]";
+int assigned_cage_id = -1;
+
+void assign_cage(int cage_id) {
+    assigned_cage_id = cage_id;
+    printf("[INFO] 할당된 케이지 ID: %d\n", assigned_cage_id);
+}
+
+int main(int argc, char *argv[]) {
+    int sock;
+    struct sockaddr_in serv_addr;
+    pthread_t rcv_thread;
+
+    if (argc != 4) {
+        printf("Usage : %s <IP> <port> <name>\n", argv[0]);
+        exit(1);
+    }
+
+    snprintf(name, sizeof(name), "%s", argv[3]);
+
+    sock = socket(PF_INET, SOCK_STREAM, 0);
+    if (sock == -1)
+        error_handling("socket() error");
+
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = inet_addr(argv[1]);
+    serv_addr.sin_port = htons(atoi(argv[2]));
+
+    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == -1)
+        error_handling("connect() error");
+
+    char login_msg[BUF_SIZE];
+    snprintf(login_msg, sizeof(login_msg), "[%s:PASSWD]", name);
+    write(sock, login_msg, strlen(login_msg));
+
+    pthread_create(&rcv_thread, NULL, recv_msg, (void *)&sock);
+    user_command_loop(&sock);
+    pthread_join(rcv_thread, NULL);
+
+    close(sock);
+    return 0;
+}
+
+void print_user_interface(){
+    printf("\n[ Smart Cage 제어 메뉴 ]\n");
+    printf("1. 케이지 할당 요청\n");
+    if (assigned_cage_id != -1) {
+        printf("2. 케이지 할당 해제 요청\n");
+        printf("3. 케이지 센서 값 출력 요청\n");
+        printf("4. 케이지 기기 상태 확인\n");
+        printf("5. 케이지 기기 Control\n");
+    }
+    printf("6. 종료\n");
+    if(assigned_cage_id != -1)
+        printf("현재 할당된 케이지 ID: %d\n", assigned_cage_id);
+    else
+        printf("현재 할당된 케이지가 없습니다.\n");
+    printf("선택 >> ");
+}
+
+void user_command_loop(int *sock) {
+    char message[BUF_SIZE];
+    int choice;
+
+    while (1) {
+        print_user_interface();
+        if (scanf("%d", &choice) != 1) {
+            while (getchar() != '\n');
+            continue;
+        }
+        getchar();
+
+        switch (choice) {
+            case 1:
+                snprintf(message, sizeof(message), "[%s]GET_EMPTY_CAGE_ID_ALL\n", DB_name);
+                send_msg(sock, message);
+                break;
+            case 2:
+                if (assigned_cage_id != -1) {
+                    snprintf(message, sizeof(message), "[%s]UNASSIGN_CAGE@%d\n", DB_name, assigned_cage_id);
+                    send_msg(sock, message);
+                }
+                break;
+            case 3:
+                if (assigned_cage_id != -1) {
+                    // STM에 보내는 명령 (STM에서 구현해야 함)
+                    snprintf(message, sizeof(message), "[CAGE_%d]GET_SENSOR_DATA@%d\n", assigned_cage_id, assigned_cage_id);
+                    send_msg(sock, message);
+                }
+                break;
+            case 4:
+                if (assigned_cage_id != -1) {
+                    // STM에 보내는 명령 (STM에서 구현해야 함)
+                    snprintf(message, sizeof(message), "[%s]GET_CAGE_STATUS@%d\n", DB_name, assigned_cage_id);
+                    send_msg(sock, message);
+                }
+                break;
+            case 5:
+                if (assigned_cage_id != -1) {
+                    int target_device;
+                    char device_name[4];
+                    int open;
+                    printf("제어할 기기 선택 (1: 창문, 2: 선풍기, 3: 조명, 4: 문): ");
+                    if (scanf("%d", &target_device) != 1 || target_device < 1 || target_device > 4) {
+                        continue;
+                    }
+                    switch (target_device)
+                    {
+                    case 1:
+                        strncpy(device_name, "WIN", sizeof(device_name));
+                        break;
+                    case 2:
+                        strncpy(device_name, "FAN", sizeof(device_name));
+                        break;
+                    case 3:
+                        strncpy(device_name, "LED", sizeof(device_name));
+                        break;
+                    case 4:
+                        strncpy(device_name, "DOR", sizeof(device_name));
+                        break;
+                    }
+                    getchar();  // 개행 문자 제거
+                    printf("제어할 상태 선택 (1: ON, 0: OFF): ");
+                    if (scanf("%d", &open) != 1 || (open != 0 && open != 1)) {
+                        printf("잘못된 입력입니다.\n");
+                        continue;
+                    }
+                    getchar();  // 개행 문자 제거
+                    // STM에 보내는 명령 (STM에서 구현해야 함)
+                    // [CAGE_1]CAGE_CONTROL@1@WIN@ON`
+                    snprintf(message, sizeof(message), "[CAGE_%d]CAGE_CONTROL@%d@%s@%s\n", assigned_cage_id, assigned_cage_id, device_name, open ? "ON" : "OFF");
+                    send_msg(sock, message);
+                }
+                break;
+            case 6:
+                printf("프로그램 종료\n");
+                snprintf(message, sizeof(message), "[%s]GET_EMPTY_CAGE_ID_ALL\n", DB_name);
+                send_msg(sock, message);
+                return;
+            default:
+                printf("잘못된 입력입니다. 다시 선택해주세요.\n");
+        }
+    }
+}
+
+void send_msg(int *sock, const char *msg) {
+    if (write(*sock, msg, strlen(msg)) <= 0) {
+        *sock = -1;
+        perror("[ERROR] send_msg 실패");
+    }
+}
+
+void *recv_msg(void *arg) {
+    int *sock = (int *)arg;
+    char name_msg[NAME_SIZE + BUF_SIZE + 1];
+    char *pToken, *pArray[ARR_CNT];
+    int str_len, i;
+
+    while (1) {
+        memset(name_msg, 0x0, sizeof(name_msg));
+        str_len = read(*sock, name_msg, NAME_SIZE + BUF_SIZE);
+
+        if (str_len <= 0) {
+            *sock = -1;
+            return NULL;
+        }
+
+        name_msg[strcspn(name_msg, "\n")] = '\0';
+        printf("\nDEBUG [RECV] %s\n", name_msg);
+
+        for (i = 0; i < ARR_CNT; i++) pArray[i] = NULL;
+        pToken = strtok(name_msg, "[:@]");
+        i = 0;
+        while (pToken != NULL && i < ARR_CNT) {
+            pArray[i++] = pToken;
+            pToken = strtok(NULL, "[:@]");
+        }
+
+        if (pArray[1]) {
+            if (strcmp(pArray[1], "GET_EMPTY_CAGE_ID_ALL") == 0 && i >= 3) {
+                int cage_id = atoi(pArray[2]);
+                assign_cage(cage_id);
+
+                char assign_msg[BUF_SIZE];
+                snprintf(assign_msg, sizeof(assign_msg), "[%s]ASSIGN_CAGE@%d@%s\n", DB_name, cage_id, name);
+                send_msg(sock, assign_msg);
+                print_user_interface();
+            } else if (strcmp(pArray[1], "UNASSIGN_CAGE") == 0 && i >= 4) {
+                if (strcmp(pArray[i - 1], "SUCCESS") == 0) {
+                    assigned_cage_id = -1;
+                    printf("[INFO] 케이지 할당 해제됨.\n");
+                } else {
+                    printf("[WARN] 케이지 할당 해제 실패.\n");
+                }
+            } else if (strcmp(pArray[1], "GET_SENSOR_DATA") == 0 && i == 6) {
+                printf("[센서] 온도: %s, 습도: %s, 조도: %s\n", pArray[3], pArray[4], pArray[5]);
+            } else if (strcmp(pArray[1], "GET_CAGE_STATUS") == 0 && i == 6) {
+                printf("창문: %s, 선풍기: %s, 조명: %s, 문: %s\n",
+                       strcmp(pArray[2], "1") == 0 ? "열림" : "닫힘",
+                       strcmp(pArray[3], "1") == 0 ? "켜짐" : "꺼짐",
+                       strcmp(pArray[4], "1") == 0 ? "켜짐" : "꺼짐",
+                       strcmp(pArray[5], "1") == 0 ? "열림" : "닫힘");
+            }
+            else if (strcmp(pArray[1], "CAGE_CONTROL") == 0 && i >= 6) {
+                // [CAGE_1]CAGE_CONTROL@1@WIN@ON@SUCCESS
+                // [CAGE_1]CAGE_CONTROL@cage_id@device@state@SUCCESS
+                const char *target = pArray[3];
+                const char *state = pArray[4];
+                const char *isSuccess = pArray[5];
+                
+                if (strcmp(target, "WIN") == 0) {
+                    printf("[상태] 창문: %s %s\n", strcmp(state, "ON") == 0 ? "열림" : "닫힘", 
+                           (strcmp(isSuccess, "SUCCESS") == 0) ? "성공" : "실패");
+                } else if (strcmp(target, "FAN") == 0) {
+                    printf("[상태] 선풍기: %s %s\n", strcmp(state, "ON") == 0 ? "켜짐" : "꺼짐", 
+                           strcmp(isSuccess, "SUCCESS") == 0 ? "성공" : "실패");
+                } else if (strcmp(target, "LED") == 0) {
+                    printf("[상태] 조명: %s %s\n", strcmp(state, "ON") == 0 ? "켜짐" : "꺼짐", 
+                           strcmp(isSuccess, "SUCCESS") == 0 ? "성공" : "실패");
+                } else if (strcmp(target, "DOR") == 0) {
+                    printf("[상태] 문: %s %s\n", strcmp(state, "ON") == 0 ? "열림" : "닫힘", 
+                           strcmp(isSuccess, "SUCCESS") == 0 ? "성공" : "실패");
+                } else {
+                    printf("[경고] 알 수 없는 장치 상태 수신: %s\n", target);
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+void error_handling(char *msg) {
+    fputs(msg, stderr);
+    fputc('\n', stderr);
+    exit(1);
+}
