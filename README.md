@@ -1,3 +1,4 @@
+
 # Smart_Cage
 
 ## 프로젝트 목표
@@ -54,3 +55,11 @@ Arduino를 사용해 관리자 시스템 구현 (**사용자 제어 가능**)
 | MariaDB | 케이지 상태, 사용자, 제어 기록 저장 |
 | Bluetooth 모듈 (내장) | Arduino와 관리자 통신 처리 |
 | TCP/IP 소켓 서버 | 사용자 앱 및 각 케이지(CCU)와의 통신 |
+
+
+## 시연 영상
+
+https://github.com/user-attachments/assets/32a868ee-a661-4adf-88d7-780307e38f85
+
+https://github.com/user-attachments/assets/1c0dc678-4889-4b04-a151-bf87b9829a58
+
