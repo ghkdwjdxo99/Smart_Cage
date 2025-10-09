@@ -29,7 +29,7 @@ Arduino를 사용해 관리자 시스템 구현 (**사용자 제어 가능**)
 |------|------|------|
 | **User (사용자)** | 사용자 명령 입력 및 상태 확인 인터페이스 | LDplayer4 (모바일) |
 | **Server (서버)** | - 전체 시스템의 중앙 제어 서버<br>- 모든 CCU로부터 케이지 상태 수신 및 저장<br>- 사용자 제어 요청 처리<br>- 관리자 MCU와 Bluetooth 통신<br>- 케이지 할당, 기기 동작 상태, 대여 시간 등 기록 | Raspberry Pi |
-| **CCU (Cage Control Unit)** | - 각 케이지에 1대씩 설치<br>- 온도, 습도, 조도 센서 측정<br>- 내부 조명 LED 제어<br>- 창문 개폐 모터 제어<br>- 선풍기 모터 제어<br>- Wi-Fi로 서버와 직접 통신 | STM32 |
+| **CCU (Cage Control Unit)** | - 각 케이지에 1대씩 설치<br>- 온도, 습도, 조도 센서 측정<br>- 내부 조명 LED 제어<br>- 창문 개폐 모터 제어<br>- 선풍기 모터 제어<br>- Wi-Fi로 서버와 TCP/IP 통신 | STM32 |
 | **MCU (Manager Control Unit)** | - 관리자 전용 제어 보드<br>- 서버(Raspberry Pi)와 Bluetooth로 통신<br>- 케이지 상태 전체 모니터링<br>- 관리자 제어 명령 전송 (창문, LED, 팬, 부저 등) | Arduino + Bluetooth 모듈 |
 
 
@@ -39,7 +39,7 @@ Arduino를 사용해 관리자 시스템 구현 (**사용자 제어 가능**)
 |-----------|------|
 | DHT11 | 온습도 측정 |
 | CDS 센서 (LDR) | 조도 측정 |
-| LED × 2 | 상태 표시 (내부 LED, 외부 상태 LED) |
+| LED | 상태 표시 (내부 LED) |
 | 서보 모터 (SG-90) | 창문 개폐 |
 | ESP-01 (Wi-Fi 모듈) | TCP/IP로 Raspberry Pi와 통신 |
 
